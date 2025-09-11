@@ -1,0 +1,804 @@
+from __future__ import annotations
+
+import asyncio
+import queue
+import threading
+import time
+from typing import Optional, Tuple
+from starlette.concurrency import run_in_threadpool
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+# Global driver pool - configurable via environment
+from .config import settings
+from .utils import pick_user_agent
+POOL_SIZE = settings.selenium_pool_size
+# Maintain separate pools for page load strategies
+_driver_pools: dict[str, queue.Queue] = {
+    'normal': queue.Queue(),
+    'eager': queue.Queue(),
+}
+_pool_initialized: dict[str, bool] = {'normal': False, 'eager': False}
+_pool_lock = threading.Lock()
+
+
+def _create_driver(proxy: Optional[str] = None, user_agent: Optional[str] = None, page_load_strategy: str = 'normal') -> webdriver.Chrome:
+    """Create a new Chrome driver with enhanced stability and anti-detection options.
+
+    page_load_strategy: 'normal' | 'eager'
+    """
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    
+    # Enhanced stability flags for problematic sites
+    options.add_argument("--disable-logging")
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,VizDisplayCompositor")
+    options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--remote-debugging-port=0")  # Disable DevTools
+    
+    # Additional anti-detection and stability flags
+    options.add_argument("--disable-web-security")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-hang-monitor")
+    options.add_argument("--disable-prompt-on-repost")
+    options.add_argument("--disable-domain-reliability")
+    options.add_argument("--disable-component-extensions-with-background-pages")
+    options.add_argument("--disable-client-side-phishing-detection")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-translate")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-permissions-api")
+    
+    # Memory and performance optimizations
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--max_old_space_size=4096")
+    options.add_argument("--aggressive-cache-discard")
+    
+    # Enhanced user agent handling
+    if user_agent:
+        options.add_argument(f"--user-agent={user_agent}")
+    else:
+        # Default realistic user agent
+        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    
+    # Enhanced proxy handling
+    if proxy and proxy.strip() and proxy.strip().lower() != "string":
+        options.add_argument(f"--proxy-server={proxy}")
+        # Disable proxy-related security features that might interfere
+        options.add_argument("--ignore-ssl-errors-on-proxy")
+        options.add_argument("--ignore-certificate-errors-spki-list")
+        options.add_argument("--ignore-certificate-errors")
+    
+    # Enhanced stealth settings
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins-discovery")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--disable-images")  # Faster loading
+    options.add_argument("--disable-javascript-harmony-shipping")
+    
+    # Window size for consistent rendering
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--start-maximized")
+    
+    # Page load strategy
+    try:
+        if page_load_strategy in ('eager', 'normal'):
+            options.page_load_strategy = page_load_strategy
+    except Exception:
+        pass
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    # Mark driver with its strategy for returning to the right pool
+    try:
+        setattr(driver, "_strategy_key", 'eager' if page_load_strategy == 'eager' else 'normal')
+    except Exception:
+        pass
+    
+    # Enhanced anti-detection script
+    stealth_script = """
+    (() => {
+      try {
+        // navigator.webdriver
+        try {
+          const desc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')
+                     || Object.getOwnPropertyDescriptor((navigator || {}).__proto__ || {}, 'webdriver');
+          if ((desc && desc.configurable) || !('webdriver' in navigator)) {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+          }
+        } catch (e) {}
+        
+        // plugins
+        try {
+          if (!navigator.plugins || navigator.plugins.length === 0) {
+            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+          }
+        } catch (e) {}
+        
+        // languages
+        try {
+          if (!navigator.languages || navigator.languages.length === 0) {
+            Object.defineProperty(navigator, 'languages', { get: () => ['de-DE','de','en-US','en'] });
+          }
+        } catch (e) {}
+        
+        // permissions
+        try {
+          const originalQuery = navigator.permissions && navigator.permissions.query;
+          if (originalQuery) {
+            navigator.permissions.query = (parameters) => (
+              parameters && parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+            );
+          }
+        } catch (e) {}
+        
+        // chrome runtime - do not redefine if present/non-configurable
+        try {
+          const hasChrome = 'chrome' in window;
+          if (!hasChrome) {
+            Object.defineProperty(window, 'chrome', {
+              value: { runtime: {} },
+              configurable: true
+            });
+          } else if (window.chrome && typeof window.chrome === 'object') {
+            window.chrome.runtime = window.chrome.runtime || {};
+          }
+        } catch (e) {}
+      } catch (e) {}
+    })();
+    """
+    try:
+        driver.execute_script(stealth_script)
+    except Exception:
+        # If stealth injection fails, continue without it to avoid hard failures
+        pass
+    
+    return driver
+
+
+def _initialize_pool(strategy_key: str):
+    """Initialize the driver pool for the given strategy on first use."""
+    with _pool_lock:
+        if not _pool_initialized.get(strategy_key, False):
+            for _ in range(POOL_SIZE):
+                driver = _create_driver(page_load_strategy=('eager' if strategy_key == 'eager' else 'normal'))
+                _driver_pools[strategy_key].put(driver)
+            _pool_initialized[strategy_key] = True
+
+
+def _pick_strategy_key(js_strategy: str) -> str:
+    return 'eager' if js_strategy == 'speed' else 'normal'
+
+
+def _get_driver(js_strategy: str) -> webdriver.Chrome:
+    """Get a driver from the appropriate pool based on strategy."""
+    key = _pick_strategy_key(js_strategy)
+    if not _pool_initialized.get(key, False):
+        _initialize_pool(key)
+    return _driver_pools[key].get()
+
+
+def _return_driver(driver: webdriver.Chrome):
+    """Return a driver to the appropriate pool."""
+    try:
+        key = getattr(driver, "_strategy_key", 'normal')
+    except Exception:
+        key = 'normal'
+    try:
+        _driver_pools[key].put(driver)
+    except Exception:
+        # Fallback
+        _driver_pools['normal'].put(driver)
+
+
+def _try_click_cookie_banners(driver: webdriver.Chrome):
+    """Try to click common cookie acceptance buttons and handle overlays."""
+    selectors = [
+        "button:contains('Accept')",
+        "button:contains('Akzeptieren')",
+        "button:contains('Alle akzeptieren')",
+        "button:contains('Agree')",
+        "button:contains('Zustimmen')",
+        "button:contains('OK')",
+        "#onetrust-accept-btn-handler",
+        "button[aria-label*='Accept']",
+        "button[id*='accept']",
+        "button[class*='accept']",
+        "button[class*='cookie']",
+        "[data-testid*='accept']",
+        ".cookie-accept",
+        ".accept-cookies",
+        "#cookieAccept",
+        "#accept-cookies",
+    ]
+    
+    for selector in selectors:
+        try:
+            # Use CSS selector for most, XPath for text content
+            if ":contains(" in selector:
+                text = selector.split(":contains('")[1].split("')")[0]
+                element = driver.find_element(By.XPATH, f"//button[contains(text(), '{text}')]")
+            else:
+                element = driver.find_element(By.CSS_SELECTOR, selector)
+            
+            if element.is_displayed():
+                # Scroll element into view
+                driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                time.sleep(0.2)
+                
+                # Try regular click first
+                try:
+                    element.click()
+                except Exception:
+                    # Fallback to JavaScript click
+                    driver.execute_script("arguments[0].click();", element)
+                
+                time.sleep(1)  # Wait for banner to disappear
+                break
+        except Exception:
+            continue
+
+
+def _try_click_cookie_banners_fast(driver: webdriver.Chrome, max_seconds: float = 1.5) -> bool:
+    """Fast cookie banner scan using find_elements with implicit wait disabled.
+
+    Scans a compact set of robust selectors and exits on first successful click.
+    """
+    try:
+        # Temporarily disable implicit waits
+        prev = driver.timeouts.implicit_wait
+    except Exception:
+        prev = 0
+    try:
+        driver.implicitly_wait(0)
+        # Quick pre-check: is there any consent/cookie overlay at all?
+        try:
+            has_overlay = driver.execute_script(
+                """
+                return !!document.querySelector(
+                  "[id*='consent'],[class*='consent'],[id*='cookie'],[class*='cookie']"
+                );
+                """
+            )
+            if not has_overlay:
+                return False
+        except Exception:
+            pass
+
+        selectors = [
+            "#onetrust-accept-btn-handler",
+            "button[aria-label*='Accept']",
+            "button[aria-label*='accept']",
+            "button[aria-label*='Zustimmen']",
+            "button[id*='accept']",
+            "button[class*='accept']",
+            "[data-testid*='accept']",
+            ".cookie-accept",
+            ".accept-cookies",
+            "#accept-cookies",
+        ]
+        deadline = time.time() + max_seconds
+        while time.time() < deadline:
+            for sel in selectors:
+                try:
+                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                except Exception:
+                    elems = []
+                if elems:
+                    el = elems[0]
+                    try:
+                        driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                        time.sleep(0.05)
+                        try:
+                            el.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", el)
+                        time.sleep(0.2)
+                        return True
+                    except Exception:
+                        continue
+            time.sleep(0.12)
+        return False
+    finally:
+        try:
+            driver.implicitly_wait(prev)
+        except Exception:
+            pass
+
+
+def _any_loader_visible(driver: webdriver.Chrome) -> bool:
+    """Quick check for common loading indicators being visible."""
+    selectors = [
+        '.loading', '.spinner', '.loader', '[data-loading]',
+        '.loading-spinner', '.loading-overlay', '.preloader',
+        '[aria-label*="loading"]', '[aria-label*="Loading"]'
+    ]
+    try:
+        for sel in selectors:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return False
+
+
+def _has_overlay_or_body_lock(driver: webdriver.Chrome) -> bool:
+    """Detects common consent/modal overlays or body scroll lock.
+
+    Uses a combination of CSS selectors and viewport coverage heuristics.
+    """
+    try:
+        return driver.execute_script(
+            """
+            try {
+              const doc = document;
+              const body = doc.body;
+              const de = doc.documentElement;
+              const gv = (el, prop) => el ? getComputedStyle(el)[prop] : '';
+              const overflowLocked = ['hidden','clip'].includes(gv(body,'overflow')) || ['hidden','clip'].includes(gv(de,'overflow'));
+
+              // Common CMP/overlay selectors
+              const sel = "[id*='consent'],[class*='consent'],[id*='cookie'],[class*='cookie'],[class*='overlay'],[class*='backdrop'],[class*='modal'],[aria-modal='true'],.qc-cmp-ui,.qc-cmp2-container,.qc-cmp3-container,.sp_veil,#sp_message_container_*,#sp_message_iframe_*,.ReactModal__Overlay,.cc-window,.osano-cm-dialog";
+              const overlay = doc.querySelector(sel);
+              if (overlay && (overlay.offsetWidth * overlay.offsetHeight) > 0) return true;
+
+              // Heuristic: any fixed element covering >50% viewport
+              const vw = window.innerWidth || 0; const vh = window.innerHeight || 0;
+              const area = vw * vh;
+              if (area > 0) {
+                const nodes = Array.from(doc.querySelectorAll('*'));
+                for (const el of nodes) {
+                  try {
+                    const cs = getComputedStyle(el);
+                    if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
+                    if (cs.visibility === 'hidden' || cs.display === 'none' || cs.opacity === '0') continue;
+                    const r = el.getBoundingClientRect();
+                    const cover = Math.max(0, Math.min(vw, r.right) - Math.max(0, r.left)) * Math.max(0, Math.min(vh, r.bottom) - Math.max(0, r.top));
+                    if (cover / area > 0.5) return true;
+                  } catch(e) { /* ignore */ }
+                }
+              }
+              return !!overflowLocked;
+            } catch (e) { return false; }
+            """
+        )
+    except Exception:
+        return False
+
+
+
+def _wait_for_mathjax(driver: webdriver.Chrome, timeout_ms: int = 5000) -> bool:
+    """If MathJax is present, wait for typesetPromise to complete to ensure formulas render."""
+    try:
+        return driver.execute_async_script(
+            """
+            const done = arguments[0];
+            try {
+              if (window.MathJax && MathJax.typesetPromise) {
+                MathJax.typesetPromise().then(() => done(true)).catch(() => done(false));
+              } else {
+                done(true);
+              }
+            } catch (e) { done(true); }
+            """
+        )
+    except Exception:
+        return False
+
+
+def _attempt_with_temp_driver(
+    url: str,
+    timeout_seconds: int,
+    proxy: Optional[str],
+    max_bytes: int,
+    js_strategy: str = "accuracy",
+    budget_left: Optional[float] = None,
+) -> Optional[Tuple[int, str, bytes, Optional[str]]]:
+    """One-shot retry using a fresh driver with a rotated user agent.
+
+    Lightweight and strictly budget-bounded to avoid long stalls.
+    """
+    ua = pick_user_agent(settings.default_user_agent)
+    temp = _create_driver(proxy=proxy, user_agent=ua)
+    try:
+        # Bound by remaining budget if provided
+        effective_to = min(timeout_seconds, int(max(1.0, budget_left))) if budget_left else timeout_seconds
+        temp.set_page_load_timeout(effective_to)
+        if js_strategy == "accuracy":
+            temp.implicitly_wait(5)
+        else:
+            temp.implicitly_wait(0)
+
+        temp.get(url)
+
+        # Strategy-aware basic readiness
+        try:
+            if js_strategy == "accuracy":
+                WebDriverWait(temp, min(10, effective_to)).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            else:
+                WebDriverWait(temp, min(6, effective_to)).until(
+                    lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
+                )
+        except Exception:
+            pass
+
+        # Fast cookie scan for non-accuracy
+        try:
+            if js_strategy == "accuracy":
+                _try_click_cookie_banners(temp)
+            else:
+                _try_click_cookie_banners_fast(temp, max(0.2, min(0.4, (budget_left or 1.0))))
+        except Exception:
+            pass
+
+        # Skip heavy SPA waits here; do a very light stabilization only
+        try:
+            is_spa = temp.execute_script(
+                """
+                return !!(window.React || window.Vue || window.angular || 
+                         document.querySelector('[data-reactroot]') ||
+                         document.querySelector('[ng-app]') ||
+                         document.querySelector('.vue-app'));
+                """
+            )
+        except Exception:
+            is_spa = False
+
+        # Skip SPA processing - not needed for educational content
+
+        # MathJax: only if present and with a small cap for non-accuracy
+        try:
+            has_mj = temp.execute_script("return !!(window.MathJax && MathJax.typesetPromise);")
+        except Exception:
+            has_mj = False
+        if has_mj:
+            if js_strategy == "accuracy":
+                _wait_for_mathjax(temp)
+            else:
+                _wait_for_mathjax(temp, timeout_ms=700)
+
+        # Minimal settle
+        time.sleep(0.2 if js_strategy != "accuracy" else 0.8)
+
+        content = temp.page_source
+        final_url = temp.current_url
+        content_bytes = content.encode("utf-8")[:max_bytes]
+        return 200, final_url, content_bytes, "text/html; charset=utf-8"
+    except Exception:
+        return None
+    finally:
+        try:
+            temp.quit()
+        except Exception:
+            pass
+
+
+def _detect_error_pages(content: str) -> bool:
+    """Detect if content indicates an error page (404, 500, etc.)."""
+    error_patterns = [
+        # German patterns
+        "seite wurde nicht gefunden",
+        "seite nicht gefunden", 
+        "fehler 404",
+        "404 fehler",
+        "seite existiert nicht",
+        "gewünschte seite",
+        "server fehler",
+        "interner fehler",
+        "temporär nicht verfügbar",
+        
+        # English patterns
+        "page not found",
+        "404 error",
+        "not found",
+        "page does not exist",
+        "server error",
+        "internal error",
+        "temporarily unavailable",
+        "access denied",
+        
+        # Bot detection patterns
+        "verifying you are human",
+        "checking your browser",
+        "cloudflare",
+        "bot protection",
+        "security check",
+        "please wait",
+        "loading...",
+        "javascript required",
+        "javascript wird benötigt",
+        "enable javascript",
+    ]
+    
+    content_lower = content.lower()
+    for pattern in error_patterns:
+        if pattern in content_lower:
+            return True
+    return False
+
+
+class TimeBudget:
+    """Global time budget helper to cap total JS runtime.
+
+    Based on a deadline (now + seconds). Use .left() to get remaining seconds and
+    .slice(desired, floor) to obtain a safe timeout bounded by the budget.
+    """
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + max(0.0, float(seconds))
+
+    def left(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def ok(self) -> bool:
+        return self.left() > 0.0
+
+    def slice(self, desired: float, floor: float = 0.3) -> float:
+        """Return a timeout not exceeding desired nor the remaining budget.
+
+        Ensures a minimal positive floor to avoid zero-second waits when possible.
+        """
+        remaining = self.left()
+        if remaining <= 0.0:
+            return 0.0
+        return max(0.0 if desired <= 0 else min(desired, remaining), 0.0 if floor <= 0 else min(floor, remaining))
+
+
+def _selenium_fetch(
+    url: str,
+    timeout_seconds: int,
+    retries: int,
+    proxy: Optional[str],
+    user_agent: str,
+    max_bytes: int,
+    wait_for_selectors: Optional[list[str]] = None,
+    wait_for_ms: Optional[int] = None,
+    js_strategy: str = "accuracy",
+) -> Tuple[int, str, bytes, Optional[str]]:
+    """Fetch URL using Selenium with enhanced SPA and error handling."""
+    driver = _get_driver(js_strategy)
+    
+    budget = TimeBudget(timeout_seconds)
+    
+    try:
+        # Set timeouts
+        # Cap navigation timeout for speed to avoid long stalls (aggressive)
+        nav_cap = 8 if js_strategy == "speed" else min(8, timeout_seconds)
+        driver.set_page_load_timeout(max(1, int(min(nav_cap, budget.left()))))
+        # Strategy-based implicit wait: both use 0 for explicit control
+        driver.implicitly_wait(0)
+        
+        last_exc = None
+        max_attempts = (min(retries, 1) + 1) if js_strategy == "speed" else (retries + 1)
+        for attempt in range(max_attempts):
+            if not budget.ok():
+                break
+            try:
+                # Block heavy resources for both modes to accelerate load
+                blocked_applied = False
+                try:
+                    driver.execute_cdp_cmd('Network.enable', {})
+                    driver.execute_cdp_cmd('Network.setBlockedURLs', {
+                        'urls': [
+                            '*doubleclick*', '*googlesyndication*', '*googletagmanager*',
+                            '*facebook.com/tr*', '*google-analytics*', '*googleadservices*',
+                            '*adsystem*', '*amazon-adsystem*', '*googletag*'
+                        ]
+                    })
+                    blocked_applied = True
+                except Exception:
+                    blocked_applied = False
+                # Navigate to URL
+                driver.get(url)
+                
+                # Wait for basic page load (strategy-aware)
+                if js_strategy == "accuracy":
+                    WebDriverWait(driver, max(0.5, min(6.0, budget.left()))).until(
+                        lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
+                    )
+                else:
+                    # For speed accept DOMContentLoaded ('interactive') to start earlier (tighter cap)
+                    WebDriverWait(driver, max(0.5, min(5.0, budget.left()))).until(
+                        lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
+                    )
+                
+                # Try to click cookie banners early
+                try:
+                    if js_strategy == "accuracy":
+                        if budget.ok():
+                            _try_click_cookie_banners(driver)
+                    else:
+                        # Fast scan with small budget (speed only)
+                        if budget.ok():
+                            _try_click_cookie_banners_fast(
+                                driver,
+                                max(0.1, min(0.25, budget.left()))
+                            )
+                except Exception:
+                    pass
+
+                # Speed-only CMP escalation: if overlay/body-lock persists, grant a one-off larger cookie budget
+                if js_strategy == "speed" and budget.ok():
+                    try:
+                        if _has_overlay_or_body_lock(driver):
+                            _try_click_cookie_banners_fast(
+                                driver,
+                                max(0.6, min(1.0, budget.left()))
+                            )
+                    except Exception:
+                        pass
+                
+                # Speed mode: skip all SPA detection and waits - extract immediately after basic load
+                if js_strategy == "speed":
+                    # Minimal wait for basic content, then extract
+                    time.sleep(min(1.0, budget.left()))
+                    try:
+                        content = driver.page_source
+                    except Exception:
+                        content = ""
+                    final_url = driver.current_url
+                    content_bytes = content.encode("utf-8")[:max_bytes]
+                    return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                
+                # Accuracy mode: use speed-like approach with longer settle
+                if js_strategy == "accuracy" and budget.ok():
+                    # Longer settle for accuracy but then DIRECT extraction like speed mode
+                    time.sleep(min(2.0, budget.left()))
+                    try:
+                        content = driver.page_source
+                    except Exception:
+                        content = ""
+                    final_url = driver.current_url
+                    content_bytes = content.encode("utf-8")[:max_bytes]
+                    return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                
+                # Get page source and URL
+                try:
+                    content = driver.page_source
+                except Exception:
+                    continue
+                final_url = driver.current_url
+                
+                # Check for error pages
+                if _detect_error_pages(content):
+                    # Try to extract actual HTTP status from browser without blocking the UI thread for long.
+                    try:
+                        status_code = None
+                        if js_strategy == "accuracy":
+                            # Keep existing behavior in accuracy
+                            status_code = driver.execute_script(
+                                """
+                                var xhr = new XMLHttpRequest();
+                                xhr.open('HEAD', window.location.href, false);
+                                xhr.send();
+                                return xhr.status;
+                                """
+                            )
+                        else:
+                            # Speed: async HEAD with short timeout to avoid stalls (e.g., Cloudflare challenges)
+                            status_code = driver.execute_async_script(
+                                """
+                                const done = arguments[0];
+                                const to = arguments[1] || 1200;
+                                try {
+                                  const xhr = new XMLHttpRequest();
+                                  xhr.open('HEAD', window.location.href, true);
+                                  xhr.timeout = to;
+                                  xhr.onreadystatechange = function(){ if (xhr.readyState === 4) done(xhr.status); };
+                                  xhr.ontimeout = function(){ done(0); };
+                                  xhr.onerror = function(){ done(0); };
+                                  xhr.send();
+                                } catch(e) { done(0); }
+                                """,
+                                int(min(1500, max(200, budget.left() * 1000)))
+                            )
+                        if isinstance(status_code, int) and status_code >= 400:
+                            content_bytes = content.encode("utf-8")[:max_bytes]
+                            return status_code, final_url, content_bytes, "text/html; charset=utf-8"
+                    except Exception:
+                        pass
+                    # If still looks like an error (but HTTP may be 200), try a one-off UA-rotated attempt
+                    alt = None
+                    if js_strategy != "speed" and budget.left() > 3.0:
+                        alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
+                    if alt:
+                        return alt
+                
+                # If page content is suspiciously short, attempt UA-rotated retry once
+                if len(content) < 1200 and js_strategy != "speed" and budget.left() > 3.0:
+                    alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
+                    if alt:
+                        return alt
+                
+                # Enforce max_bytes
+                content_bytes = content.encode("utf-8")[:max_bytes]
+                
+                return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                
+            except Exception as e:
+                last_exc = e
+                # Exponential backoff with cap, but respect budget
+                if not budget.ok():
+                    break
+                backoff = min(2 ** attempt, 5)
+                time.sleep(min(backoff, budget.left()))
+            finally:
+                # Restore CDP blocked URLs so pooled driver does not leak settings
+                if js_strategy == "speed" and blocked_applied:
+                    try:
+                        driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': []})
+                    except Exception:
+                        pass
+        # If we get here, retries exhausted
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Unknown JS fetch error")
+        
+    finally:
+        _return_driver(driver)
+
+
+async def fetch_with_playwright(
+    url: str,
+    timeout_seconds: int,
+    retries: int,
+    proxy: Optional[str],
+    user_agent: str,
+    max_bytes: int,
+    headless: bool = True,
+    stealth: bool = True,
+    wait_for_selectors: Optional[list[str]] = None,
+    wait_for_ms: Optional[int] = None,
+    js_strategy: str = "accuracy",
+) -> Tuple[int, str, bytes, Optional[str]]:
+    """
+    Selenium-based fetching with driver pool (renamed for compatibility).
+    Returns: (status_code, final_url, content_bytes, content_type)
+    """
+    return await run_in_threadpool(
+        _selenium_fetch,
+        url, timeout_seconds, retries, proxy, user_agent, max_bytes,
+        wait_for_selectors, wait_for_ms, js_strategy
+    )
+
+
+def cleanup_drivers():
+    """Clean up all drivers in all pools."""
+    for key in list(_driver_pools.keys()):
+        q = _driver_pools.get(key)
+        if not q:
+            continue
+        while not q.empty():
+            try:
+                driver = q.get_nowait()
+                driver.quit()
+            except Exception:
+                pass
