@@ -1,23 +1,101 @@
 from __future__ import annotations
 
 import time
-from fastapi import FastAPI, HTTPException
+import asyncio
+import logging
+import httpx
+from selenium.common.exceptions import WebDriverException
+from fastapi import FastAPI, HTTPException, Body
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response, JSONResponse
 
 from .config import settings
 from .schemas import CrawlRequest, CrawlResponse, LLMResult, LinkInfo
 from .http_fetcher import fetch_with_httpx
 from .preflight import preflight as preflight_analyze
-from .js_fetcher import fetch_with_playwright, cleanup_drivers
+from .js_fetcher import fetch_with_playwright, cleanup_drivers, get_pool_stats
 from .converter import bytes_to_markdown
 from .utils import detect_error_page, extract_links_detailed_from_html, normalize_proxy, pick_user_agent
-from .llm import postprocess_markdown
-import sys
-import asyncio
+from .llm import postprocess_markdown, postprocess_markdown_async
 
-# No special event loop policy needed - subprocess approach handles this
+logger = logging.getLogger(__name__)
+
+# Enhanced request capacity management (simplified and deadlock-safe)
+_concurrent_requests = 0
+_waiting_count = 0  # number of requests waiting to acquire capacity
+_max_concurrent = settings.selenium_max_pool_size  # Use max pool size for better capacity
+_request_semaphore = asyncio.Semaphore(_max_concurrent)
+_request_lock = asyncio.Lock()
+
+
+class SmartCapacityMiddleware(BaseHTTPMiddleware):
+    """Capacity management using a semaphore and bounded waiting with timeout.
+
+    This design avoids awaiting while holding the internal lock to prevent deadlocks.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        global _concurrent_requests, _waiting_count
+
+        # Only apply limits to crawl endpoints
+        if request.url.path != "/crawl":
+            return await call_next(request)
+
+        # Check if we can enter immediately or must wait. We never await while holding the lock.
+        # Enforce a bounded waiting room using _waiting_count against max_queue_size.
+        async with _request_lock:
+            can_enter_now = _concurrent_requests < _max_concurrent
+            if not can_enter_now:
+                if _waiting_count >= settings.max_queue_size:
+                    logger.warning(
+                        f"Request rejected: waiting room full ({_waiting_count}/{settings.max_queue_size})"
+                    )
+                    return JSONResponse(
+                        content={"detail": "Server overloaded. Queue is full. Please retry later."},
+                        status_code=503,
+                    )
+                _waiting_count += 1
+
+        acquired = False
+        try:
+            # Try to acquire capacity with a timeout (queueing behavior)
+            try:
+                await asyncio.wait_for(_request_semaphore.acquire(), timeout=settings.queue_timeout_seconds)
+                acquired = True
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    content={"detail": "Request timed out in queue"}, status_code=504
+                )
+
+            # We have capacity, update counters
+            async with _request_lock:
+                if _waiting_count > 0:
+                    _waiting_count -= 1
+                _concurrent_requests += 1
+
+            # Process the request
+            try:
+                response = await call_next(request)
+                return response
+            except Exception as e:
+                logger.error(f"Request processing error: {e}")
+                return JSONResponse(
+                    content={"detail": f"Request processing failed: {str(e)}"}, status_code=502
+                )
+            finally:
+                async with _request_lock:
+                    _concurrent_requests -= 1
+        finally:
+            if acquired:
+                _request_semaphore.release()
+
+
+# Removed request object queuing helpers; semaphore-based waiting is used instead.
 
 
 app = FastAPI(title="Volltextextraktion Selenium MD", version="0.1.0")
+app.add_middleware(SmartCapacityMiddleware)
 
 
 @app.on_event("shutdown")
@@ -31,8 +109,101 @@ async def root():
     return {"status": "ok"}
 
 
-@app.post("/crawl", response_model=CrawlResponse)
-async def crawl(req: CrawlRequest):
+@app.get("/stats")
+async def get_stats():
+    """Get current API and pool statistics."""
+    pool_stats = get_pool_stats()
+    global _concurrent_requests
+    
+    async with _request_lock:
+        queue_size = _waiting_count
+        concurrent = _concurrent_requests
+    
+    return {
+        "concurrent_requests": concurrent,
+        "max_concurrent": _max_concurrent,
+        "queue_size": queue_size,
+        "max_queue_size": settings.max_queue_size,
+        "selenium_pools": pool_stats,
+        "capacity_utilization": {
+            "processing": f"{concurrent}/{_max_concurrent}",
+            "queue": f"{queue_size}/{settings.max_queue_size}",
+            "total_capacity": f"{concurrent + queue_size}/{_max_concurrent + settings.max_queue_size}"
+        }
+    }
+
+
+@app.post(
+    "/crawl",
+    response_model=CrawlResponse,
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "url": "https://example.com",
+                        "mode": "auto",
+                        "js_strategy": "speed",
+                        "html_converter": "trafilatura",
+                        "trafilatura_clean_markdown": True,
+                        "media_conversion_policy": "skip",
+                        "allow_insecure_ssl": True,
+                        "extract_links": False,
+                        "llm_postprocess": False,
+                        "llm_anonymize": False,
+                        "llm_clean_prompt": None,
+                        "retries": 2,
+                        "timeout_ms": 30000,
+                        "max_bytes": 1048576,
+                    }
+                }
+            }
+        }
+    },
+)
+async def crawl(
+    req: CrawlRequest = Body(
+        ..., 
+        example={
+            "url": "https://example.com",
+            "mode": "auto",
+            "js_strategy": "speed",
+            "html_converter": "trafilatura",
+            "trafilatura_clean_markdown": True,
+            "media_conversion_policy": "skip",
+            "allow_insecure_ssl": True,
+            "extract_links": False,
+            "llm_postprocess": False,
+            "llm_anonymize": False,
+            "llm_clean_prompt": None,
+            "retries": 2,
+            "timeout_ms": 30000,
+            "max_bytes": 1048576,
+        },
+        openapi_examples={
+            "standard": {
+                "summary": "Standardvorgaben",
+                "description": "Beispiel-Body in gewünschter Reihenfolge",
+                "value": {
+                    "url": "https://example.com",
+                    "mode": "auto",
+                    "js_strategy": "speed",
+                    "html_converter": "trafilatura",
+                    "trafilatura_clean_markdown": True,
+                    "media_conversion_policy": "skip",
+                    "allow_insecure_ssl": True,
+                    "extract_links": False,
+                    "llm_postprocess": False,
+                    "llm_anonymize": False,
+                    "llm_clean_prompt": None,
+                    "retries": 2,
+                    "timeout_ms": 30000,
+                    "max_bytes": 1048576,
+                },
+            }
+        }
+    )
+):
     """
     Crawlt eine Webseite und konvertiert sie automatisch zu strukturiertem Markdown.
     
@@ -68,6 +239,14 @@ async def crawl(req: CrawlRequest):
     - `accuracy`:
       - Maximale Qualität/Robustheit, mit leicht aggressiveren Caps als zuvor
     
+    ## 🔧 Schema-Overrides (pro Request)
+    Optional können Standardwerte aus der .env pro Request überschrieben werden:
+    - `html_converter`: "trafilatura" | "markitdown" | "bs4" (Default aus .env)
+    - `trafilatura_clean_markdown`: true | false | null (null = .env-Default)
+    - `media_conversion_policy`: "skip" | "metadata" | "full" | "none" (Default: "skip")
+      - Hinweis: "none" erzeugt keinerlei Markdown-Ausgabe für Medien
+    - `allow_insecure_ssl`: true | false | null (null = .env-Default)
+
     ## 📄 Unterstützte Formate:
     - **Web**: HTML, XHTML, XML, RSS/Atom-Feeds
     - **Office**: DOCX, PPTX, XLSX, ODT, ODS, ODP
@@ -140,10 +319,16 @@ async def crawl(req: CrawlRequest):
                 proxy=proxy_norm,
                 user_agent=ua,
                 max_bytes=max_bytes,
+                allow_insecure_ssl=req.allow_insecure_ssl,
             )
         elif req.mode == "auto":
             # Lightweight preflight to pick best path quickly
-            pf = await preflight_analyze(str(req.url), timeout_seconds=min(timeout_s, 12), user_agent=ua)
+            pf = await preflight_analyze(
+                str(req.url),
+                timeout_seconds=min(timeout_s, 12),
+                user_agent=ua,
+                allow_insecure_ssl=req.allow_insecure_ssl,
+            )
             strat = pf.get("strategy")
             # Direct return cases without Selenium
             if strat in {"PDF", "RSS", "HTTP_ONLY", "YOUTUBE"}:
@@ -202,10 +387,32 @@ async def crawl(req: CrawlRequest):
             )
     except Exception as e:
         msg = str(e) or repr(e)
-        raise HTTPException(status_code=502, detail=f"Fetch error: {type(e).__name__}: {msg}")
+        logger.error(f"Fetch error for {req.url}: {type(e).__name__}: {msg}")
+        # Map specific error types to more precise status codes
+        status_code = 502
+        low = msg.lower()
+        if isinstance(e, (httpx.ReadTimeout, httpx.ConnectTimeout)) or "timeout" in low:
+            status_code = 504  # Gateway Timeout / upstream timeout
+        elif isinstance(e, WebDriverException) and ("timed out receiving message from renderer" in low):
+            status_code = 504
+        elif isinstance(e, httpx.ConnectError):
+            status_code = 502  # Bad Gateway / upstream connect error
+        raise HTTPException(status_code=status_code, detail=f"Fetch error: {type(e).__name__}: {msg}")
 
-    # Convert to markdown
-    markdown = bytes_to_markdown(data, content_type=ctype, url=str(req.url))
+    # Convert to markdown with error handling
+    try:
+        markdown = bytes_to_markdown(
+            data,
+            content_type=ctype,
+            url=str(req.url),
+            html_converter=req.html_converter,
+            trafilatura_clean_markdown=req.trafilatura_clean_markdown,
+            media_conversion_policy=req.media_conversion_policy,
+        )
+    except Exception as e:
+        logger.error(f"Markdown conversion failed for {req.url}: {e}")
+        # Return a meaningful error response instead of crashing
+        markdown = f"# Content Conversion Failed\n\nFailed to convert content from {req.url}\n\nError: {str(e)}\n\nThis may be due to a corrupted file, unsupported format, or network issue."
 
     # Optional link extraction (only for HTML-like data)
     links = None
@@ -225,27 +432,31 @@ async def crawl(req: CrawlRequest):
     if req.llm_postprocess:
         api_key = settings.llm_api_key
         if not api_key:
-            raise HTTPException(status_code=500, detail="LLM_API_KEY not configured in environment")
+            # Do not fail the entire request if LLM is not configured
+            logger.warning("LLM postprocess requested but LLM_API_KEY is not configured. Skipping LLM step.")
+            api_key = None
         try:
-            cleaned, cls, anonymized, tokens = postprocess_markdown(
-                markdown=markdown,
-                base_url=final_url,
-                api_key=api_key,
-                model=settings.llm_model or "gpt-4.1-mini",
-                base=settings.llm_base_url,
-                clean_prompt=req.llm_clean_prompt,
-                anonymize=req.llm_anonymize,
-            )
-            llm_payload = LLMResult(
-                cleaned_markdown=cleaned,
-                classification=cls,  # type: ignore[arg-type]
-                anonymized=anonymized,
-                tokens_used=tokens,
-            )
-            # Keep original markdown in main field, cleaned version only in llm field
+            if api_key:
+                cleaned, cls, anonymized, tokens = await postprocess_markdown_async(
+                    markdown=markdown,
+                    base_url=final_url,
+                    api_key=api_key,
+                    model=settings.llm_model or "gpt-5-mini",
+                    base=settings.llm_base_url,
+                    clean_prompt=req.llm_clean_prompt,
+                    anonymize=req.llm_anonymize,
+                )
+                llm_payload = LLMResult(
+                    cleaned_markdown=cleaned,
+                    classification=cls,  # type: ignore[arg-type]
+                    anonymized=anonymized,
+                    tokens_used=tokens,
+                )
+                # Keep original markdown in main field, cleaned version only in llm field
         except Exception as e:
+            # Never escalate LLM errors to a 500 for the whole crawl
             msg = str(e) or repr(e)
-            raise HTTPException(status_code=500, detail=f"LLM postprocess error: {type(e).__name__}: {msg}")
+            logger.error(f"LLM postprocess error: {type(e).__name__}: {msg}")
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
 

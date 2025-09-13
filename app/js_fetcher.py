@@ -19,14 +19,20 @@ from webdriver_manager.chrome import ChromeDriverManager
 # Global driver pool - configurable via environment
 from .config import settings
 from .utils import pick_user_agent
-POOL_SIZE = settings.selenium_pool_size
-# Maintain separate pools for page load strategies
+
+# Dynamic pool management
 _driver_pools: dict[str, queue.Queue] = {
     'normal': queue.Queue(),
     'eager': queue.Queue(),
 }
+_pool_sizes: dict[str, int] = {
+    'normal': settings.selenium_pool_size,
+    'eager': settings.selenium_pool_size,
+}
+_pool_usage: dict[str, int] = {'normal': 0, 'eager': 0}  # Track active drivers
 _pool_initialized: dict[str, bool] = {'normal': False, 'eager': False}
 _pool_lock = threading.Lock()
+_scaling_lock = threading.Lock()
 
 
 def _create_driver(proxy: Optional[str] = None, user_agent: Optional[str] = None, page_load_strategy: str = 'normal') -> webdriver.Chrome:
@@ -95,7 +101,6 @@ def _create_driver(proxy: Optional[str] = None, user_agent: Optional[str] = None
     options.add_argument("--disable-plugins-discovery")
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")  # Faster loading
-    options.add_argument("--disable-javascript-harmony-shipping")
     
     # Window size for consistent rendering
     options.add_argument("--window-size=1920,1080")
@@ -183,7 +188,8 @@ def _initialize_pool(strategy_key: str):
     """Initialize the driver pool for the given strategy on first use."""
     with _pool_lock:
         if not _pool_initialized.get(strategy_key, False):
-            for _ in range(POOL_SIZE):
+            initial_size = _pool_sizes[strategy_key]
+            for _ in range(initial_size):
                 driver = _create_driver(page_load_strategy=('eager' if strategy_key == 'eager' else 'normal'))
                 _driver_pools[strategy_key].put(driver)
             _pool_initialized[strategy_key] = True
@@ -193,25 +199,156 @@ def _pick_strategy_key(js_strategy: str) -> str:
     return 'eager' if js_strategy == 'speed' else 'normal'
 
 
-def _get_driver(js_strategy: str) -> webdriver.Chrome:
-    """Get a driver from the appropriate pool based on strategy."""
+def _get_driver(js_strategy: str, timeout_seconds: int = 30) -> webdriver.Chrome:
+    """Get a driver from the appropriate pool with dynamic scaling."""
     key = _pick_strategy_key(js_strategy)
     if not _pool_initialized.get(key, False):
         _initialize_pool(key)
-    return _driver_pools[key].get()
+    
+    # Check if we should scale up the pool
+    _maybe_scale_pool(key)
+    
+    try:
+        # Track usage for scaling decisions
+        with _scaling_lock:
+            _pool_usage[key] += 1
+        
+        # Use timeout to prevent indefinite blocking if pool is exhausted
+        driver = _driver_pools[key].get(timeout=timeout_seconds)
+        return driver
+    except queue.Empty:
+        # Try scaling up one more time if we hit capacity
+        if _try_emergency_scale(key):
+            try:
+                driver = _driver_pools[key].get(timeout=5)  # Short retry
+                return driver
+            except queue.Empty:
+                pass
+        raise TimeoutException(f"No available drivers in {key} pool after {timeout_seconds}s. Pool exhausted at size {_pool_sizes[key]}.")
 
 
 def _return_driver(driver: webdriver.Chrome):
-    """Return a driver to the appropriate pool."""
+    """Return a driver to the appropriate pool with health check and usage tracking."""
+    key = getattr(driver, "_strategy_key", 'normal')
+    
     try:
-        key = getattr(driver, "_strategy_key", 'normal')
-    except Exception:
-        key = 'normal'
-    try:
+        # Track usage decrease
+        with _scaling_lock:
+            _pool_usage[key] = max(0, _pool_usage[key] - 1)
+        
+        # Basic health check - if driver is broken, don't return it
+        try:
+            driver.current_url  # Simple check to see if driver is responsive
+        except Exception:
+            # Driver is broken, create a new one to replace it
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            # Create replacement driver
+            page_load_strategy = 'eager' if key == 'eager' else 'normal'
+            replacement = _create_driver(page_load_strategy=page_load_strategy)
+            _driver_pools[key].put(replacement)
+            return
+        
+        # Driver is healthy, return to pool
         _driver_pools[key].put(driver)
+        
+        # Check if we should scale down (after returning driver)
+        _maybe_scale_down(key)
+        
     except Exception:
-        # Fallback
-        _driver_pools['normal'].put(driver)
+        # If anything fails, try to put in normal pool as fallback
+        try:
+            _driver_pools['normal'].put(driver)
+        except Exception:
+            # If even that fails, the driver is lost - create a replacement
+            try:
+                replacement = _create_driver(page_load_strategy='normal')
+                _driver_pools['normal'].put(replacement)
+            except Exception:
+                pass  # Give up gracefully
+
+
+def _maybe_scale_pool(key: str):
+    """Check if pool should be scaled up based on usage."""
+    with _scaling_lock:
+        current_size = _pool_sizes[key]
+        current_usage = _pool_usage[key]
+        available = _driver_pools[key].qsize()
+        
+        # Scale up if usage is high and we're near capacity
+        usage_ratio = current_usage / max(current_size, 1)
+        if (usage_ratio >= settings.selenium_scale_threshold and 
+            available <= 1 and 
+            current_size < settings.selenium_max_pool_size):
+            
+            # Add one more driver
+            try:
+                page_load_strategy = 'eager' if key == 'eager' else 'normal'
+                new_driver = _create_driver(page_load_strategy=page_load_strategy)
+                _driver_pools[key].put(new_driver)
+                _pool_sizes[key] += 1
+                print(f"Scaled up {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
+            except Exception as e:
+                print(f"Failed to scale up {key} pool: {e}")
+
+
+def _try_emergency_scale(key: str) -> bool:
+    """Emergency scaling when pool is completely exhausted."""
+    with _scaling_lock:
+        current_size = _pool_sizes[key]
+        if current_size < settings.selenium_max_pool_size:
+            try:
+                page_load_strategy = 'eager' if key == 'eager' else 'normal'
+                new_driver = _create_driver(page_load_strategy=page_load_strategy)
+                _driver_pools[key].put(new_driver)
+                _pool_sizes[key] += 1
+                print(f"Emergency scaled {key} pool to {_pool_sizes[key]} drivers")
+                return True
+            except Exception as e:
+                print(f"Emergency scaling failed for {key} pool: {e}")
+        return False
+
+
+def _maybe_scale_down(key: str):
+    """Check if pool should be scaled down when usage is low."""
+    with _scaling_lock:
+        current_size = _pool_sizes[key]
+        current_usage = _pool_usage[key]
+        available = _driver_pools[key].qsize()
+        min_size = settings.selenium_pool_size  # Don't go below initial size
+        
+        # Scale down if we have too many idle drivers
+        if (current_size > min_size and 
+            available > current_size * 0.7 and  # 70% of drivers are idle
+            current_usage < current_size * 0.3):  # Low usage
+            
+            try:
+                # Remove one idle driver
+                idle_driver = _driver_pools[key].get_nowait()
+                idle_driver.quit()
+                _pool_sizes[key] -= 1
+                print(f"Scaled down {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
+            except (queue.Empty, Exception):
+                pass  # No idle drivers or cleanup failed
+
+
+def get_pool_stats() -> dict:
+    """Get current pool statistics for monitoring."""
+    with _scaling_lock:
+        return {
+            'normal': {
+                'size': _pool_sizes['normal'],
+                'usage': _pool_usage['normal'],
+                'available': _driver_pools['normal'].qsize(),
+            },
+            'eager': {
+                'size': _pool_sizes['eager'], 
+                'usage': _pool_usage['eager'],
+                'available': _driver_pools['eager'].qsize(),
+            }
+        }
 
 
 def _try_click_cookie_banners(driver: webdriver.Chrome):
@@ -584,195 +721,245 @@ def _selenium_fetch(
     js_strategy: str = "accuracy",
 ) -> Tuple[int, str, bytes, Optional[str]]:
     """Fetch URL using Selenium with enhanced SPA and error handling."""
-    driver = _get_driver(js_strategy)
-    
-    budget = TimeBudget(timeout_seconds)
-    
-    try:
-        # Set timeouts
-        # Cap navigation timeout for speed to avoid long stalls (aggressive)
-        nav_cap = 8 if js_strategy == "speed" else min(8, timeout_seconds)
-        driver.set_page_load_timeout(max(1, int(min(nav_cap, budget.left()))))
-        # Strategy-based implicit wait: both use 0 for explicit control
-        driver.implicitly_wait(0)
+    def _sync_fetch():
+        driver = None
+        try:
+            # Get driver with timeout to prevent indefinite blocking
+            driver = _get_driver(js_strategy, timeout_seconds=min(timeout_seconds, 30))
+        except Exception as e:
+            raise WebDriverException(f"Failed to acquire driver from pool: {e}")
         
-        last_exc = None
-        max_attempts = (min(retries, 1) + 1) if js_strategy == "speed" else (retries + 1)
-        for attempt in range(max_attempts):
-            if not budget.ok():
-                break
+        try:
+            budget = TimeBudget(timeout_seconds)
+    
             try:
-                # Block heavy resources for both modes to accelerate load
-                blocked_applied = False
-                try:
-                    driver.execute_cdp_cmd('Network.enable', {})
-                    driver.execute_cdp_cmd('Network.setBlockedURLs', {
-                        'urls': [
-                            '*doubleclick*', '*googlesyndication*', '*googletagmanager*',
-                            '*facebook.com/tr*', '*google-analytics*', '*googleadservices*',
-                            '*adsystem*', '*amazon-adsystem*', '*googletag*'
-                        ]
-                    })
-                    blocked_applied = True
-                except Exception:
-                    blocked_applied = False
-                # Navigate to URL
-                driver.get(url)
+                # Set timeouts
+                # Cap navigation timeout for speed to avoid long stalls (aggressive)
+                nav_cap = 8 if js_strategy == "speed" else min(8, timeout_seconds)
+                driver.set_page_load_timeout(max(1, int(min(nav_cap, budget.left()))))
+                # Strategy-based implicit wait: both use 0 for explicit control
+                driver.implicitly_wait(0)
                 
-                # Wait for basic page load (strategy-aware)
-                if js_strategy == "accuracy":
-                    WebDriverWait(driver, max(0.5, min(6.0, budget.left()))).until(
-                        lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
-                    )
-                else:
-                    # For speed accept DOMContentLoaded ('interactive') to start earlier (tighter cap)
-                    WebDriverWait(driver, max(0.5, min(5.0, budget.left()))).until(
-                        lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
-                    )
-                
-                # Try to click cookie banners early
-                try:
-                    if js_strategy == "accuracy":
-                        if budget.ok():
-                            _try_click_cookie_banners(driver)
-                    else:
-                        # Fast scan with small budget (speed only)
-                        if budget.ok():
-                            _try_click_cookie_banners_fast(
-                                driver,
-                                max(0.1, min(0.25, budget.left()))
-                            )
-                except Exception:
-                    pass
-
-                # Speed-only CMP escalation: if overlay/body-lock persists, grant a one-off larger cookie budget
-                if js_strategy == "speed" and budget.ok():
+                last_exc = None
+                did_early_accuracy = False
+                max_attempts = (min(retries, 1) + 1) if js_strategy == "speed" else (retries + 1)
+                for attempt in range(max_attempts):
+                    if not budget.ok():
+                        break
                     try:
-                        if _has_overlay_or_body_lock(driver):
-                            _try_click_cookie_banners_fast(
-                                driver,
-                                max(0.6, min(1.0, budget.left()))
-                            )
-                    except Exception:
-                        pass
-                
-                # Speed mode: skip all SPA detection and waits - extract immediately after basic load
-                if js_strategy == "speed":
-                    # Minimal wait for basic content, then extract
-                    time.sleep(min(1.0, budget.left()))
-                    try:
-                        content = driver.page_source
-                    except Exception:
-                        content = ""
-                    final_url = driver.current_url
-                    content_bytes = content.encode("utf-8")[:max_bytes]
-                    return 200, final_url, content_bytes, "text/html; charset=utf-8"
-                
-                # Accuracy mode: use speed-like approach with longer settle
-                if js_strategy == "accuracy" and budget.ok():
-                    # Longer settle for accuracy but then DIRECT extraction like speed mode
-                    time.sleep(min(2.0, budget.left()))
-                    try:
-                        content = driver.page_source
-                    except Exception:
-                        content = ""
-                    final_url = driver.current_url
-                    content_bytes = content.encode("utf-8")[:max_bytes]
-                    return 200, final_url, content_bytes, "text/html; charset=utf-8"
-                
-                # Get page source and URL
-                try:
-                    content = driver.page_source
-                except Exception:
-                    continue
-                final_url = driver.current_url
-                
-                # Check for error pages
-                if _detect_error_pages(content):
-                    # Try to extract actual HTTP status from browser without blocking the UI thread for long.
-                    try:
-                        status_code = None
+                        # Block heavy resources for both modes to accelerate load
+                        blocked_applied = False
+                        try:
+                            driver.execute_cdp_cmd('Network.enable', {})
+                            driver.execute_cdp_cmd('Network.setBlockedURLs', {
+                                'urls': [
+                                    '*doubleclick*', '*googlesyndication*', '*googletagmanager*',
+                                    '*facebook.com/tr*', '*google-analytics*', '*googleadservices*',
+                                    '*adsystem*', '*amazon-adsystem*', '*googletag*'
+                                ]
+                            })
+                            blocked_applied = True
+                        except Exception:
+                            blocked_applied = False
+                        # Navigate to URL
+                        driver.get(url)
+                        
+                        # Wait for basic page load (strategy-aware)
                         if js_strategy == "accuracy":
-                            # Keep existing behavior in accuracy
-                            status_code = driver.execute_script(
-                                """
-                                var xhr = new XMLHttpRequest();
-                                xhr.open('HEAD', window.location.href, false);
-                                xhr.send();
-                                return xhr.status;
-                                """
+                            WebDriverWait(driver, max(0.5, min(6.0, budget.left()))).until(
+                                lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
                             )
                         else:
-                            # Speed: async HEAD with short timeout to avoid stalls (e.g., Cloudflare challenges)
-                            status_code = driver.execute_async_script(
-                                """
-                                const done = arguments[0];
-                                const to = arguments[1] || 1200;
-                                try {
-                                  const xhr = new XMLHttpRequest();
-                                  xhr.open('HEAD', window.location.href, true);
-                                  xhr.timeout = to;
-                                  xhr.onreadystatechange = function(){ if (xhr.readyState === 4) done(xhr.status); };
-                                  xhr.ontimeout = function(){ done(0); };
-                                  xhr.onerror = function(){ done(0); };
-                                  xhr.send();
-                                } catch(e) { done(0); }
-                                """,
-                                int(min(1500, max(200, budget.left() * 1000)))
+                            # For speed accept DOMContentLoaded ('interactive') to start earlier (tighter cap)
+                            WebDriverWait(driver, max(0.5, min(5.0, budget.left()))).until(
+                                lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
                             )
-                        if isinstance(status_code, int) and status_code >= 400:
+                        
+                        # Try to click cookie banners early
+                        try:
+                            if js_strategy == "accuracy":
+                                if budget.ok():
+                                    _try_click_cookie_banners(driver)
+                            else:
+                                # Fast scan with small budget (speed only)
+                                if budget.ok():
+                                    _try_click_cookie_banners_fast(
+                                        driver,
+                                        max(0.1, min(0.25, budget.left()))
+                                    )
+                        except Exception:
+                            pass
+
+                        # Speed-only CMP escalation: if overlay/body-lock persists, grant a one-off larger cookie budget
+                        if js_strategy == "speed" and budget.ok():
+                            try:
+                                if _has_overlay_or_body_lock(driver):
+                                    _try_click_cookie_banners_fast(
+                                        driver,
+                                        max(0.6, min(1.0, budget.left()))
+                                    )
+                            except Exception:
+                                pass
+                        
+                        # Speed mode: skip all SPA detection and waits - extract immediately after basic load
+                        if js_strategy == "speed":
+                            # Minimal wait for basic content, then extract
+                            time.sleep(min(1.0, budget.left()))
+                            try:
+                                content = driver.page_source
+                            except Exception:
+                                content = ""
+                            final_url = driver.current_url
                             content_bytes = content.encode("utf-8")[:max_bytes]
-                            return status_code, final_url, content_bytes, "text/html; charset=utf-8"
-                    except Exception:
-                        pass
-                    # If still looks like an error (but HTTP may be 200), try a one-off UA-rotated attempt
-                    alt = None
-                    if js_strategy != "speed" and budget.left() > 3.0:
-                        alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
-                    if alt:
-                        return alt
-                
-                # If page content is suspiciously short, attempt UA-rotated retry once
-                if len(content) < 1200 and js_strategy != "speed" and budget.left() > 3.0:
-                    alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
-                    if alt:
-                        return alt
-                
-                # Enforce max_bytes
-                content_bytes = content.encode("utf-8")[:max_bytes]
-                
-                return 200, final_url, content_bytes, "text/html; charset=utf-8"
-                
-            except Exception as e:
-                last_exc = e
-                # Exponential backoff with cap, but respect budget
-                if not budget.ok():
-                    break
-                backoff = min(2 ** attempt, 5)
-                time.sleep(min(backoff, budget.left()))
-            finally:
-                # Restore CDP blocked URLs so pooled driver does not leak settings
-                if js_strategy == "speed" and blocked_applied:
+                            return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                        
+                        # Accuracy mode: use speed-like approach with longer settle
+                        if js_strategy == "accuracy" and budget.ok():
+                            # Longer settle for accuracy but then DIRECT extraction like speed mode
+                            time.sleep(min(2.0, budget.left()))
+                            try:
+                                content = driver.page_source
+                            except Exception:
+                                content = ""
+                            final_url = driver.current_url
+                            content_bytes = content.encode("utf-8")[:max_bytes]
+                            return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                        
+                        # Get page source and URL
+                        try:
+                            content = driver.page_source
+                        except Exception:
+                            continue
+                        final_url = driver.current_url
+                        
+                        # Check for error pages
+                        if _detect_error_pages(content):
+                            # Try to extract actual HTTP status from browser without blocking the UI thread for long.
+                            try:
+                                status_code = None
+                                if js_strategy == "accuracy":
+                                    # Keep existing behavior in accuracy
+                                    status_code = driver.execute_script(
+                                        """
+                                        var xhr = new XMLHttpRequest();
+                                        xhr.open('HEAD', window.location.href, false);
+                                        xhr.send();
+                                        return xhr.status;
+                                        """
+                                    )
+                                else:
+                                    # Speed: async HEAD with short timeout to avoid stalls (e.g., Cloudflare challenges)
+                                    status_code = driver.execute_async_script(
+                                        """
+                                        const done = arguments[0];
+                                        const to = arguments[1] || 1200;
+                                        try {
+                                          const xhr = new XMLHttpRequest();
+                                          xhr.open('HEAD', window.location.href, true);
+                                          xhr.timeout = to;
+                                          xhr.onreadystatechange = function(){ if (xhr.readyState === 4) done(xhr.status); };
+                                          xhr.ontimeout = function(){ done(0); };
+                                          xhr.onerror = function(){ done(0); };
+                                          xhr.send();
+                                        } catch(e) { done(0); }
+                                        """,
+                                        int(min(1500, max(200, budget.left() * 1000)))
+                                    )
+                                if isinstance(status_code, int) and status_code >= 400:
+                                    content_bytes = content.encode("utf-8")[:max_bytes]
+                                    return status_code, final_url, content_bytes, "text/html; charset=utf-8"
+                            except Exception:
+                                pass
+                            # If still looks like an error (but HTTP may be 200), try a one-off UA-rotated attempt
+                            alt = None
+                            if js_strategy != "speed" and budget.left() > 3.0:
+                                alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
+                            if alt:
+                                return alt
+                        
+                        # If page content is suspiciously short, attempt UA-rotated retry once
+                        if len(content) < 1200 and js_strategy != "speed" and budget.left() > 3.0:
+                            alt = _attempt_with_temp_driver(url, timeout_seconds, proxy, max_bytes, js_strategy, budget.left())
+                            if alt:
+                                return alt
+                        
+                        # Enforce max_bytes
+                        content_bytes = content.encode("utf-8")[:max_bytes]
+                        
+                        return 200, final_url, content_bytes, "text/html; charset=utf-8"
+                        
+                    except Exception as e:
+                        last_exc = e
+                        # Early fallback: first renderer timeout in speed mode -> one-shot accuracy attempt
+                        try:
+                            if (
+                                not did_early_accuracy
+                                and js_strategy == "speed"
+                                and budget.left() > 2.0
+                            ):
+                                msg = (str(e) or "").lower()
+                                if "timed out receiving message from renderer" in msg:
+                                    alt = _attempt_with_temp_driver(
+                                        url,
+                                        timeout_seconds=timeout_seconds,
+                                        proxy=proxy,
+                                        max_bytes=max_bytes,
+                                        js_strategy="accuracy",
+                                        budget_left=budget.left(),
+                                    )
+                                    did_early_accuracy = True
+                                    if alt:
+                                        return alt
+                        except Exception:
+                            pass
+                        # Exponential backoff with cap, but respect budget
+                        if not budget.ok():
+                            break
+                        backoff = min(2 ** attempt, 5)
+                        time.sleep(min(backoff, budget.left()))
+                    finally:
+                        # Restore CDP blocked URLs so pooled driver does not leak settings
+                        if js_strategy == "speed" and blocked_applied:
+                            try:
+                                driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': []})
+                            except Exception:
+                                pass
+                # If we get here, retries exhausted
+                if last_exc:
+                    # Fallback: if speed mode failed with renderer/timeout issues, try one-shot accuracy attempt
                     try:
-                        driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': []})
+                        if js_strategy == "speed" and budget.left() > 2.0:
+                            alt = _attempt_with_temp_driver(
+                                url,
+                                timeout_seconds=timeout_seconds,
+                                proxy=proxy,
+                                max_bytes=max_bytes,
+                                js_strategy="accuracy",
+                                budget_left=budget.left(),
+                            )
+                            if alt:
+                                return alt
                     except Exception:
                         pass
-        # If we get here, retries exhausted
-        if last_exc:
-            raise last_exc
-        raise RuntimeError("Unknown JS fetch error")
-        
-    finally:
-        _return_driver(driver)
+                    raise last_exc
+                raise RuntimeError("Unknown JS fetch error")
+                
+            finally:
+                _return_driver(driver)
+        except Exception as e:
+            raise WebDriverException(f"Failed to fetch URL: {e}")
+        return None
+
+    return _sync_fetch()
 
 
 async def fetch_with_playwright(
     url: str,
-    timeout_seconds: int,
-    retries: int,
-    proxy: Optional[str],
-    user_agent: str,
-    max_bytes: int,
+    timeout_seconds: int = 30,
+    retries: int = 1,
+    proxy: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    max_bytes: int = 50 * 1024 * 1024,
     headless: bool = True,
     stealth: bool = True,
     wait_for_selectors: Optional[list[str]] = None,
@@ -791,14 +978,19 @@ async def fetch_with_playwright(
 
 
 def cleanup_drivers():
-    """Clean up all drivers in all pools."""
-    for key in list(_driver_pools.keys()):
-        q = _driver_pools.get(key)
-        if not q:
-            continue
-        while not q.empty():
-            try:
-                driver = q.get_nowait()
-                driver.quit()
-            except Exception:
-                pass
+    """Clean up all drivers in pools."""
+    with _pool_lock:
+        for pool in _driver_pools.values():
+            while not pool.empty():
+                try:
+                    driver = pool.get_nowait()
+                    driver.quit()
+                except Exception:
+                    pass
+        # Reset pool state
+        _pool_initialized['normal'] = False
+        _pool_initialized['eager'] = False
+        _pool_sizes['normal'] = settings.selenium_pool_size
+        _pool_sizes['eager'] = settings.selenium_pool_size
+        _pool_usage['normal'] = 0
+        _pool_usage['eager'] = 0

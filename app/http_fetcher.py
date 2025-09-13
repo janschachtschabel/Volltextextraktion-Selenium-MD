@@ -4,6 +4,7 @@ import asyncio
 import httpx
 from typing import Optional, Tuple
 import inspect
+from .config import settings
 
 
 DEFAULT_HEADERS = {
@@ -27,6 +28,7 @@ async def fetch_with_httpx(
     proxy: Optional[str],
     user_agent: str,
     max_bytes: int,
+    allow_insecure_ssl: Optional[bool] = None,
 ) -> Tuple[int, str, bytes, Optional[str]]:
     """
     Returns: (status_code, final_url, content_bytes, content_type)
@@ -37,6 +39,9 @@ async def fetch_with_httpx(
     limits = httpx.Limits(max_connections=10, max_keepalive_connections=4)
     timeout = httpx.Timeout(timeout_seconds)
 
+    # Determine SSL verification based on per-request override or global setting
+    verify_ssl = not (allow_insecure_ssl if allow_insecure_ssl is not None else settings.allow_insecure_ssl)
+
     client_kwargs = dict(
         follow_redirects=True,
         headers=headers,
@@ -44,6 +49,7 @@ async def fetch_with_httpx(
         limits=limits,
         cookies=httpx.Cookies(),
         http2=True,
+        verify=verify_ssl,
     )
     try:
         sig = inspect.signature(httpx.AsyncClient)

@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from .config import settings
 
 from .http_fetcher import DEFAULT_HEADERS
 
@@ -14,6 +15,7 @@ async def preflight(
     url: str,
     timeout_seconds: int,
     user_agent: str,
+    allow_insecure_ssl: bool | None = None,
 ) -> Dict[str, Any]:
     """Lightweight HTTP probe to choose a crawl strategy.
 
@@ -29,11 +31,14 @@ async def preflight(
     headers = DEFAULT_HEADERS.copy()
     headers["User-Agent"] = user_agent
 
+    verify_ssl = not (allow_insecure_ssl if allow_insecure_ssl is not None else settings.allow_insecure_ssl)
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         headers=headers,
         timeout=httpx.Timeout(timeout_seconds),
         http2=True,
+        verify=verify_ssl,
     ) as client:
         r = await client.get(url)
 
@@ -66,7 +71,11 @@ async def preflight(
         }
 
     text = r.text or ""
-    soup = BeautifulSoup(text, "lxml")
+    # Prefer XML parser for XML content-types to avoid warnings
+    if ("xml" in ctype) and ("html" not in ctype):
+        soup = BeautifulSoup(text, "xml")
+    else:
+        soup = BeautifulSoup(text, "lxml")
 
     # Features
     text_len = len(soup.get_text(" ", strip=True))

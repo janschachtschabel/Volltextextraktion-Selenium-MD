@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Optional
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 
 
 SYSTEM_PROMPT = (
@@ -124,7 +124,6 @@ def postprocess_markdown(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0,
         )
         content = resp.output_text  # type: ignore[attr-defined]
         usage = getattr(resp, "usage", None)
@@ -137,7 +136,79 @@ def postprocess_markdown(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0,
+        )
+        content = chat.choices[0].message.content if chat.choices else ""
+        tokens_used = getattr(chat, "usage", None).total_tokens if getattr(chat, "usage", None) else None
+
+    cleaned = markdown
+    classification = "Metabeschreibung"
+    anonymized = anonymize
+
+    try:
+        data = _extract_json_object(content or "")
+        if data:
+            new_cleaned = data.get("cleaned_markdown")
+            if isinstance(new_cleaned, str):
+                cleaned = _flatten_cleaned_markdown(new_cleaned) or cleaned
+            classification = data.get("classification", classification) or classification
+            anonymized = bool(data.get("anonymized", anonymized))
+        else:
+            raise ValueError("no_json")
+    except Exception:
+        # If not JSON, try to keep the content if looks like markdown
+        if isinstance(content, str) and content.strip():
+            cleaned = _strip_code_fences(content.strip())
+
+    return cleaned, classification, anonymized, tokens_used
+
+
+async def postprocess_markdown_async(
+    *,
+    markdown: str,
+    base_url: Optional[str],
+    api_key: str,
+    model: str,
+    base: Optional[str] = None,
+    clean_prompt: Optional[str] = None,
+    anonymize: bool = False,
+) -> tuple[str, str, bool, int | None]:
+    """
+    Async variant to prevent blocking the event loop.
+    Returns: cleaned_markdown, classification, anonymized, tokens_used
+    """
+    client = AsyncOpenAI(api_key=api_key, base_url=base or None)
+
+    user_prompt = """Bereinige folgenden Markdown-Inhalt. {extra}
+---
+{md}
+---
+""".format(
+        extra=(clean_prompt or "").strip()
+        + ("\nFühre zusätzlich eine Anonymisierung personenbezogener Daten durch." if anonymize else ""),
+        md=markdown,
+    )
+
+    # Prefer Responses API if available; fallback to chat.completions
+    try:
+        # Responses API
+        resp = await client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        content = resp.output_text  # type: ignore[attr-defined]
+        usage = getattr(resp, "usage", None)
+        tokens_used = getattr(usage, "total_tokens", None) if usage else None
+    except Exception:
+        # Fallback to Chat Completions
+        chat = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
         )
         content = chat.choices[0].message.content if chat.choices else ""
         tokens_used = getattr(chat, "usage", None).total_tokens if getattr(chat, "usage", None) else None

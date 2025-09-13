@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Literal, Optional, List
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, ConfigDict
 
 
 class CrawlRequest(BaseModel):
@@ -13,10 +13,73 @@ class CrawlRequest(BaseModel):
     - 'js': Browser-Rendering für JavaScript-abhängige Seiten
     - 'auto': Pre-Flight-Analyse entscheidet zwischen HTTP_ONLY, JS_LIGHT oder Spezialpfaden
     """
+    # OpenAPI Beispiel (Standardvorgaben im Docs-Endpoint)
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "url": "https://example.com",
+                "mode": "auto",
+                "js_strategy": "speed",
+                "html_converter": "trafilatura",
+                "trafilatura_clean_markdown": True,
+                "media_conversion_policy": "skip",
+                "allow_insecure_ssl": True,
+                "extract_links": False,
+                "llm_postprocess": False,
+                "llm_anonymize": False,
+                "llm_clean_prompt": None,
+                "retries": 2,
+                "timeout_ms": 30000,
+                "max_bytes": 1048576
+            }
+        }
+    )
     
     url: HttpUrl = Field(
         description="Die zu crawlende URL",
         examples=["https://example.com", "https://docs.python.org/3/tutorial/"]
+    )
+
+    # HTML/Markdown Konvertierung (Schema-basierte Overrides)
+    html_converter: Optional[Literal["trafilatura", "markitdown", "bs4"]] = Field(
+        default=None,
+        description=(
+            "HTML→Markdown Konverter für diesen Request.\n"
+            "• trafilatura (Default in .env): Robuste Kerninhalts-Extraktion\n"
+            "• markitdown: Volle HTML→Markdown-Konvertierung\n"
+            "• bs4: Einfache Text-Extraktion (nur HTML)"
+        ),
+        examples=[None, "trafilatura", "markitdown", "bs4"],
+    )
+
+    trafilatura_clean_markdown: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Trafilatura Ausgabe-Modus: True=bereinigtes Markdown (Hauptinhalt), False=roh (html2txt).\n"
+            "Wenn None, wird der .env-Default (TRAFILATURA_CLEAN_MARKDOWN) verwendet."
+        ),
+        examples=[None, True, False],
+    )
+
+    media_conversion_policy: Optional[Literal["skip", "metadata", "full", "none"]] = Field(
+        default=None,
+        description=(
+            "Medien-Konvertierung für Audio/Video:\n"
+            "• skip (Default): keine Konvertierung, nur Platzhalter-Hinweis\n"
+            "• metadata: nur ffprobe-Metadaten als JSON\n"
+            "• full: vollständige Konvertierung (langsam)\n"
+            "• none: gar keine Konvertierungstexte (minimaler Platzhalter)"
+        ),
+        examples=[None, "skip", "metadata", "full", "none"],
+    )
+
+    allow_insecure_ssl: Optional[bool] = Field(
+        default=None,
+        description=(
+            "SSL-Validierung für diesen Request deaktivieren (verify=false).\n"
+            "Wenn None, wird der .env-Default (ALLOW_INSECURE_SSL) verwendet."
+        ),
+        examples=[None, True, False],
     )
     
     mode: Literal["fast", "js", "auto"] = Field(
