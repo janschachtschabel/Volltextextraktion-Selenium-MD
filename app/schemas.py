@@ -271,6 +271,7 @@ class CrawlResponse(BaseModel):
     content_type: str | None = Field(description="MIME-Type der Antwort (text/html, application/pdf, etc.)")
     markdown: str = Field(description="Originaler Markdown-Inhalt (unbearbeitet)")
     markdown_length: int = Field(description="Länge des Markdown-Texts in Zeichen")
+    truncated: bool = Field(description="Ob die Antwort aufgrund von max_bytes gekürzt wurde")
     error_page_detected: bool = Field(description="Ob eine Fehlerseite erkannt wurde (404, 403, etc.)")
     links: Optional[list[LinkInfo]] = Field(default=None, description="Extrahierte Links (nur wenn extract_links=true)")
     llm: Optional[LLMResult] = Field(default=None, description="LLM-Nachbearbeitung (nur wenn llm_postprocess=true)")

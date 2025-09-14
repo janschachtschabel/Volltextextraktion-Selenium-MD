@@ -29,9 +29,9 @@ async def fetch_with_httpx(
     user_agent: str,
     max_bytes: int,
     allow_insecure_ssl: Optional[bool] = None,
-) -> Tuple[int, str, bytes, Optional[str]]:
+) -> Tuple[int, str, bytes, Optional[str], bool]:
     """
-    Returns: (status_code, final_url, content_bytes, content_type)
+    Returns: (status_code, final_url, content_bytes, content_type, truncated)
     """
     headers = DEFAULT_HEADERS.copy()
     headers["User-Agent"] = user_agent
@@ -69,13 +69,14 @@ async def fetch_with_httpx(
                     final_url = str(resp.url)
                     ctype = resp.headers.get("content-type")
                     buf = bytearray()
+                    truncated = False
                     async for chunk in resp.aiter_bytes():
                         if chunk:
                             buf.extend(chunk)
                             if len(buf) > max_bytes:
-                                # Abort reading
+                                truncated = True
                                 break
-                    return status, final_url, bytes(buf[:max_bytes]), ctype
+                    return status, final_url, bytes(buf[:max_bytes]), ctype, truncated
             except Exception as e:
                 last_exc = e
                 # Exponential backoff with cap

@@ -7,6 +7,14 @@ import random
 from bs4 import BeautifulSoup
 
 
+def _soup(html: str, parser: str = "lxml") -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, parser)
+    except Exception:
+        # Fallback to built-in parser if lxml is unavailable
+        return BeautifulSoup(html, "html.parser")
+
+
 ERROR_HINTS = [
     # English
     "404", "not found", "page not found", "access denied", "forbidden", "error",
@@ -29,7 +37,7 @@ def detect_error_page(text: str, status_code: int | None) -> bool:
 
 
 def extract_links_from_html(html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "lxml")
+    soup = _soup(html)
     links: list[str] = []
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
@@ -120,7 +128,7 @@ def extract_links_detailed_from_html(html: str, base_url: str) -> list[dict]:
 
     Uses heuristics to classify links and determines internal vs external.
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _soup(html)
     items: list[dict] = []
     for tag in soup.find_all("a", href=True):
         href = (tag.get("href") or "").strip()

@@ -4,6 +4,7 @@ import asyncio
 import queue
 import threading
 import time
+import logging
 from typing import Optional, Tuple
 from starlette.concurrency import run_in_threadpool
 from selenium import webdriver
@@ -14,6 +15,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
+
+logger = logging.getLogger(__name__)
 
 
 # Global driver pool - configurable via environment
@@ -289,9 +292,9 @@ def _maybe_scale_pool(key: str):
                 new_driver = _create_driver(page_load_strategy=page_load_strategy)
                 _driver_pools[key].put(new_driver)
                 _pool_sizes[key] += 1
-                print(f"Scaled up {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
+                logger.info(f"Scaled up {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
             except Exception as e:
-                print(f"Failed to scale up {key} pool: {e}")
+                logger.error(f"Failed to scale up {key} pool: {e}")
 
 
 def _try_emergency_scale(key: str) -> bool:
@@ -304,10 +307,10 @@ def _try_emergency_scale(key: str) -> bool:
                 new_driver = _create_driver(page_load_strategy=page_load_strategy)
                 _driver_pools[key].put(new_driver)
                 _pool_sizes[key] += 1
-                print(f"Emergency scaled {key} pool to {_pool_sizes[key]} drivers")
+                logger.info(f"Emergency scaled {key} pool to {_pool_sizes[key]} drivers")
                 return True
             except Exception as e:
-                print(f"Emergency scaling failed for {key} pool: {e}")
+                logger.error(f"Emergency scaling failed for {key} pool: {e}")
         return False
 
 
@@ -329,7 +332,7 @@ def _maybe_scale_down(key: str):
                 idle_driver = _driver_pools[key].get_nowait()
                 idle_driver.quit()
                 _pool_sizes[key] -= 1
-                print(f"Scaled down {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
+                logger.info(f"Scaled down {key} pool to {_pool_sizes[key]} drivers (usage: {current_usage})")
             except (queue.Empty, Exception):
                 pass  # No idle drivers or cleanup failed
 
