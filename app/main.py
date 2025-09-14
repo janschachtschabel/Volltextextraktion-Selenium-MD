@@ -310,9 +310,10 @@ async def crawl(
     proxy_norm = normalize_proxy(req.proxy)
 
     t0 = time.perf_counter()
+    truncated = False
     try:
         if req.mode == "fast":
-            status, final_url, data, ctype = await fetch_with_httpx(
+            status, final_url, data, ctype, truncated = await fetch_with_httpx(
                 url=str(req.url),
                 timeout_seconds=timeout_s,
                 retries=retries,
@@ -336,6 +337,7 @@ async def crawl(
                 final_url = pf.get("final_url", str(req.url))
                 data = pf.get("content_bytes") or (pf.get("html_text") or "").encode("utf-8")
                 ctype = pf.get("content_type") or ("text/html; charset=utf-8" if pf.get("html_text") else None)
+                truncated = False
             else:
                 # JS paths: JS_LIGHT / JS_LIGHT_CONSENT / HTTP_THEN_JS
                 if strat == "HTTP_THEN_JS" and (pf.get("features", {}).get("text_len", 0) >= 700):
@@ -344,6 +346,7 @@ async def crawl(
                     final_url = pf.get("final_url", str(req.url))
                     data = pf.get("content_bytes") or (pf.get("html_text") or "").encode("utf-8")
                     ctype = pf.get("content_type") or "text/html; charset=utf-8"
+                    truncated = False
                 else:
                     # Run Selenium for JS_LIGHT and friends; respect provided js_strategy
                     js_strategy = req.js_strategy or "speed"
@@ -365,6 +368,7 @@ async def crawl(
                         wait_for_ms=wait_ms,
                         js_strategy=js_strategy,
                     )
+                    truncated = False
         else:
             # JS defaults: headless+stealth always on; optional auto waits from config
             js_auto_wait = settings.default_js_auto_wait
@@ -385,6 +389,7 @@ async def crawl(
                 wait_for_ms=wait_ms,
                 js_strategy=js_strategy,
             )
+            truncated = False
     except Exception as e:
         msg = str(e) or repr(e)
         logger.error(f"Fetch error for {req.url}: {type(e).__name__}: {msg}")
@@ -469,6 +474,7 @@ async def crawl(
         content_type=ctype,
         markdown=markdown,
         markdown_length=len(markdown or ""),
+        truncated=truncated,
         error_page_detected=err,
         links=links,
         llm=llm_payload,

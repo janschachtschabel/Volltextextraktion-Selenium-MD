@@ -74,3 +74,6 @@ class Settings:
 
 
 settings = Settings()
+
+if settings.selenium_max_pool_size < settings.selenium_pool_size:
+    raise ValueError("SELENIUM_MAX_POOL_SIZE must be >= SELENIUM_POOL_SIZE")

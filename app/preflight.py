@@ -6,9 +6,12 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+import logging
 from .config import settings
 
 from .http_fetcher import DEFAULT_HEADERS
+
+logger = logging.getLogger(__name__)
 
 
 async def preflight(
@@ -33,14 +36,27 @@ async def preflight(
 
     verify_ssl = not (allow_insecure_ssl if allow_insecure_ssl is not None else settings.allow_insecure_ssl)
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        headers=headers,
-        timeout=httpx.Timeout(timeout_seconds),
-        http2=True,
-        verify=verify_ssl,
-    ) as client:
-        r = await client.get(url)
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            headers=headers,
+            timeout=httpx.Timeout(timeout_seconds),
+            http2=True,
+            verify=verify_ssl,
+        ) as client:
+            r = await client.get(url)
+    except httpx.HTTPError as e:
+        logger.warning(f"Preflight HTTP error for {url}: {e}")
+        # Treat network errors as blocked to allow graceful fallback
+        return {
+            "status": 0,
+            "final_url": url,
+            "content_type": None,
+            "content_bytes": b"",
+            "html_text": None,
+            "features": {},
+            "strategy": "BLOCKED",
+        }
 
     status = r.status_code
     final_url = str(r.url)
@@ -75,7 +91,10 @@ async def preflight(
     if ("xml" in ctype) and ("html" not in ctype):
         soup = BeautifulSoup(text, "xml")
     else:
-        soup = BeautifulSoup(text, "lxml")
+        try:
+            soup = BeautifulSoup(text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(text, "html.parser")
 
     # Features
     text_len = len(soup.get_text(" ", strip=True))

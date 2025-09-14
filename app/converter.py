@@ -22,6 +22,13 @@ except Exception:  # pragma: no cover - optional dependency guarded
 
 logger = logging.getLogger(__name__)
 
+
+def _soup(html: str, parser: str = "lxml") -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html, parser)
+    except Exception:
+        return BeautifulSoup(html, "html.parser")
+
 # Simple in-process circuit breaker for MarkItDown
 _MID_FAILURES: list[float] = []  # timestamps of recent unexpected failures
 _MID_DISABLED: bool = False
@@ -157,7 +164,7 @@ def bytes_to_markdown(
         if ext == ".html":
             try:
                 html_text = data.decode("utf-8", errors="ignore")
-                soup = BeautifulSoup(html_text, "lxml")
+                soup = _soup(html_text)
                 # Remove all <noscript> blocks
                 for tag in soup.find_all("noscript"):
                     tag.decompose()
@@ -204,7 +211,14 @@ def bytes_to_markdown(
                         extracted = None
                         if eff_traf_clean and t_extract:
                             try:
-                                extracted = t_extract(cleaned, base_url=url, output_format='markdown')  # type: ignore[arg-type]
+                                extracted = t_extract(
+                                    cleaned,
+                                    base_url=url,
+                                    output_format="markdown",
+                                    include_links=False,
+                                    include_images=False,
+                                    favor_recall=True,
+                                )  # type: ignore[arg-type]
                             except Exception:
                                 extracted = None
                         elif t_html2txt:
@@ -362,7 +376,7 @@ def _fallback_content_extraction(data: bytes, content_type: Optional[str], ext: 
         if ext == ".html" or (content_type and "html" in content_type.lower()):
             try:
                 html_text = data.decode("utf-8", errors="ignore")
-                soup = BeautifulSoup(html_text, "lxml")
+                soup = _soup(html_text)
                 # Remove script and style elements
                 for script in soup(["script", "style"]):
                     script.decompose()
@@ -525,7 +539,7 @@ def _extract_kmap_markdown(soup: BeautifulSoup, base_url: Optional[str]) -> Opti
         description_html = _rewrite_inline_refs(description_html)
         # Normalize anchors and general HTML structure using BeautifulSoup
         try:
-            _desc_soup = BeautifulSoup(description_html, "lxml")
+            _desc_soup = _soup(description_html)
             description_html = str(_desc_soup)
         except Exception:
             # Fall back to original description_html if parsing fails
